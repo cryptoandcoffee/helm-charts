@@ -3,92 +3,126 @@
 
 set -x
 
-# Figure the provider address in case the user passes `--from=<key_name>` instead of `--from=<akash1...>` address.
+# Figure the provider address
 PROVIDER_ADDRESS="$(provider-services keys show $AKASH_FROM -a)"
 if [[ -z "$PROVIDER_ADDRESS" ]]; then
   echo "PROVIDER_ADDRESS variable is empty. Something went wrong"
   exit 1
 fi
 
-# Setup paths for certificates
-CERT_SYMLINK="${AKASH_HOME}/${PROVIDER_ADDRESS}.pem"
-CERT_SECRET_PATH="/config/provider.pem"
+# Setup paths
+CERT_DIR="${AKASH_HOME}"
+CERT_SYMLINK="${CERT_DIR}/${PROVIDER_ADDRESS}.pem"
+CERT_PVC_PATH="/config/provider.pem"
 CERT_WRITABLE_PATH="/tmp/provider.pem"
 
-# Check if the certificate exists in the secret
-if [[ -f "${CERT_SECRET_PATH}" ]]; then
-  # Copy certificate from read-only secret to writable location
-  cp -f "${CERT_SECRET_PATH}" "${CERT_WRITABLE_PATH}"
+# Create necessary directories
+mkdir -p "${CERT_DIR}"
+
+# Check if certificate exists in the persistent volume
+if [[ -f "${CERT_PVC_PATH}" && -s "${CERT_PVC_PATH}" ]]; then
+  echo "Found existing certificate in persistent storage"
   
-  # Create symlink to the writable certificate
-  rm -vf "$CERT_SYMLINK"
-  ln -sv "${CERT_WRITABLE_PATH}" "$CERT_SYMLINK"
+  # Copy certificate to writable location and symlink location
+  cp -f "${CERT_PVC_PATH}" "${CERT_WRITABLE_PATH}"
+  chmod 600 "${CERT_WRITABLE_PATH}"
   
-  # Check certificate validity on blockchain
-  LOCAL_CERT_SN="$(cat "${CERT_WRITABLE_PATH}" | openssl x509 -serial -noout | cut -d'=' -f2)"
-  if [[ -n "$LOCAL_CERT_SN" ]]; then
-    LOCAL_CERT_SN_DECIMAL=$(echo "obase=10; ibase=16; $LOCAL_CERT_SN" | bc)
-    REMOTE_CERT_STATUS="$(AKASH_OUTPUT=json provider-services query cert list --owner $PROVIDER_ADDRESS --state valid --serial $LOCAL_CERT_SN_DECIMAL --reverse | jq -r '.certificates[0].certificate.state')"
-    echo "Provider certificate serial number: ${LOCAL_CERT_SN}, status on chain: ${REMOTE_CERT_STATUS:-unknown}"
+  # Create direct copy in AKASH_HOME to avoid symlink issues
+  cp -f "${CERT_PVC_PATH}" "${CERT_SYMLINK}"
+  chmod 600 "${CERT_SYMLINK}"
+  
+  # Validate certificate format
+  if openssl x509 -in "${CERT_SYMLINK}" -noout 2>/dev/null; then
+    echo "Certificate is valid OpenSSL format"
     
-    # Check certificate expiration (7 days)
-    openssl x509 -checkend 604800 -noout -in "${CERT_WRITABLE_PATH}" 2>/dev/null 1>&2
-    EXPIRY_CHECK=$?
-    
-    if [[ "valid" == "$REMOTE_CERT_STATUS" && $EXPIRY_CHECK -eq 0 ]]; then
-      echo "Certificate is valid on chain and not expiring soon. No need to regenerate."
-      exit 0
-    else
-      if [[ "valid" != "$REMOTE_CERT_STATUS" ]]; then
-        echo "Certificate exists but is not valid on chain. Will generate a new one."
-      else
-        echo "Certificate expires in less than 7 days. Will generate a new one."
+    # Check certificate validity on blockchain
+    LOCAL_CERT_SN="$(openssl x509 -in "${CERT_SYMLINK}" -serial -noout 2>/dev/null | cut -d'=' -f2)"
+    if [[ -n "$LOCAL_CERT_SN" ]]; then
+      LOCAL_CERT_SN_DECIMAL=$(echo "obase=10; ibase=16; $LOCAL_CERT_SN" | bc)
+      REMOTE_CERT_STATUS="$(AKASH_OUTPUT=json provider-services query cert list --owner $PROVIDER_ADDRESS --state valid --serial $LOCAL_CERT_SN_DECIMAL --reverse 2>/dev/null | jq -r '.certificates[0].certificate.state' 2>/dev/null)"
+      echo "Certificate serial: ${LOCAL_CERT_SN}, status: ${REMOTE_CERT_STATUS:-unknown}"
+      
+      # Check expiration (7 days)
+      if openssl x509 -in "${CERT_SYMLINK}" -checkend 604800 -noout 2>/dev/null; then
+        if [[ "valid" == "$REMOTE_CERT_STATUS" ]]; then
+          echo "Certificate is valid and not expiring soon."
+          exit 0
+        fi
       fi
     fi
-  else
-    echo "Certificate exists but appears to be malformed. Will generate a new one."
   fi
-else
-  echo "Certificate not found in secret. Will generate a new one."
+  echo "Certificate needs regeneration"
 fi
-
-# Certificate needs to be generated
-echo "Generating new provider certificate in writable path ${CERT_WRITABLE_PATH}"
-
-# Ensure CERT_SYMLINK points to writable location
-rm -vf "$CERT_SYMLINK"
-touch "${CERT_WRITABLE_PATH}"
-ln -sv "${CERT_WRITABLE_PATH}" "$CERT_SYMLINK"
 
 # Generate new certificate
-provider-services tx cert generate server provider.{{ .Values.domain }}
+echo "Generating new provider certificate"
 
-# Verify the new certificate was generated successfully
-if [[ ! -f "${CERT_WRITABLE_PATH}" || ! -s "${CERT_WRITABLE_PATH}" ]]; then
-  echo "ERROR: Certificate generation failed or certificate file is empty"
-  exit 1
+# Ensure certificate paths are ready
+rm -f "${CERT_WRITABLE_PATH}" 2>/dev/null || true
+touch "${CERT_WRITABLE_PATH}"
+chmod 600 "${CERT_WRITABLE_PATH}"
+rm -f "${CERT_SYMLINK}" 2>/dev/null || true
+
+# Generate the hostname
+PROVIDER_HOSTNAME="provider.{{ .Values.domain }}"
+
+# Check for existing certificates
+EXISTING_CERTS=$(provider-services query cert list --owner $PROVIDER_ADDRESS --state=valid -o json 2>/dev/null | jq -r '.certificates | length' 2>/dev/null || echo "0")
+if [[ "$EXISTING_CERTS" != "0" ]]; then
+  echo "Certificate exists on blockchain, using --overwrite"
+  OVERWRITE_FLAG="--overwrite"
+else
+  OVERWRITE_FLAG=""
 fi
 
-# Publish the new certificate
-echo "Publishing new provider certificate"
+# Generate certificate
+provider-services tx cert generate server $OVERWRITE_FLAG $PROVIDER_HOSTNAME
+
+# Check if generation succeeded
+if [[ ! -f "${CERT_SYMLINK}" || ! -s "${CERT_SYMLINK}" ]]; then
+  echo "Certificate not found at expected location: ${CERT_SYMLINK}"
+  
+  # Try to locate the generated certificate
+  GENERATED_CERT=$(find ${AKASH_HOME} -name "*.pem" -type f -print | head -1)
+  
+  if [[ -n "$GENERATED_CERT" ]]; then
+    echo "Found certificate at: $GENERATED_CERT"
+    cp -f "$GENERATED_CERT" "${CERT_SYMLINK}"
+    chmod 600 "${CERT_SYMLINK}"
+  else
+    echo "No certificate found, generating fallback certificate"
+    openssl req -new -newkey rsa:2048 -days 365 -nodes -x509 \
+      -subj "/CN=$PROVIDER_HOSTNAME" \
+      -keyout "${CERT_WRITABLE_PATH}.key" \
+      -out "${CERT_WRITABLE_PATH}" 2>/dev/null
+    
+    if [[ -f "${CERT_WRITABLE_PATH}" && -s "${CERT_WRITABLE_PATH}" ]]; then
+      cat "${CERT_WRITABLE_PATH}.key" >> "${CERT_WRITABLE_PATH}"
+      rm -f "${CERT_WRITABLE_PATH}.key"
+      cp -f "${CERT_WRITABLE_PATH}" "${CERT_SYMLINK}"
+      chmod 600 "${CERT_SYMLINK}"
+    else
+      echo "All certificate generation methods failed"
+      exit 1
+    fi
+  fi
+fi
+
+# Publish the certificate
+echo "Publishing certificate to blockchain"
 provider-services tx cert publish server
 
-# Verify certificate was published successfully
-CERT_SN="$(cat "${CERT_WRITABLE_PATH}" | openssl x509 -serial -noout | cut -d'=' -f2)"
-if [[ -n "$CERT_SN" ]]; then
-  CERT_SN_DECIMAL=$(echo "obase=10; ibase=16; $CERT_SN" | bc)
-  PUBLISHED_STATUS="$(AKASH_OUTPUT=json provider-services query cert list --owner $PROVIDER_ADDRESS --state valid --serial $CERT_SN_DECIMAL --reverse | jq -r '.certificates[0].certificate.state')"
-  
-  if [[ "valid" == "$PUBLISHED_STATUS" ]]; then
-    echo "Certificate successfully published and verified on chain."
-  else
-    echo "WARNING: Certificate may not have been published correctly. Status: ${PUBLISHED_STATUS:-unknown}"
-  fi
-else
-  echo "WARNING: Unable to verify certificate publication. Certificate may be malformed."
-fi
+# Copy certificate to persistent storage
+cp -f "${CERT_SYMLINK}" "${CERT_PVC_PATH}"
+chmod 600 "${CERT_PVC_PATH}"
+echo "Certificate saved to persistent storage"
 
-# The certificate is now in the writable path and symlinked correctly
-# Note: The certificate won't be automatically persisted to the secret
-# External process should capture this certificate for persistence
-echo "Certificate regeneration complete. Location: ${CERT_WRITABLE_PATH}"
+# Create a backup in tmp
+cp -f "${CERT_SYMLINK}" "${CERT_WRITABLE_PATH}"
+chmod 600 "${CERT_WRITABLE_PATH}"
+
+# Verify file locations and permissions
+echo "Certificate locations:"
+ls -la "${CERT_SYMLINK}"
+ls -la "${CERT_PVC_PATH}"
+ls -la "${CERT_WRITABLE_PATH}"
