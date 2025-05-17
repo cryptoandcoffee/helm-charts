@@ -17,7 +17,6 @@ spec:
     metadata:
       annotations:
         checksum/cm-scripts: {{ include (print $.Template.BasePath "/configmap-scripts.yaml") . | sha256sum }}
-        checksum/cert-secret: {{ include (print $.Template.BasePath "/certificate-secret.yaml") . | sha256sum }}
       labels:
         app: {{ include "provider.fullname" . }}
         {{- include "provider.selectorLabels" . | nindent 8 }}
@@ -87,7 +86,7 @@ spec:
             - name: keys
               mountPath: /boot-keys
               readOnly: true
-            - name: provider-config-volume
+            - name: provider-cert
               mountPath: /config
             - name: home
               mountPath: "{{ .Values.home }}"
@@ -287,7 +286,7 @@ spec:
             - name: keys
               mountPath: /boot-keys
               readOnly: true
-            - name: provider-config-volume
+            - name: provider-cert
               mountPath: /config
             - name: home
               mountPath: "{{ .Values.home }}"
@@ -299,10 +298,9 @@ spec:
         - name: keys
           secret:
             secretName: {{ include "provider.fullname" . }}-keys
-        - name: provider-config-volume
-          secret:
-            secretName: {{ include "provider.fullname" . }}-cert
-            defaultMode: 0644
+        - name: provider-cert
+          persistentVolumeClaim:
+            claimName: {{ include "provider.fullname" . }}-cert
         - name: home
           emptyDir: {}
       {{- with .Values.nodeSelector }}
