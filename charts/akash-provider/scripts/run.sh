@@ -11,10 +11,5 @@ type bc || exit 1
 ##
 /scripts/wait_for_rpc.sh
 
-##
-# Create/Update Provider certs
-##
-/scripts/refresh_provider_cert.sh
-
 # Start provider-services and monitor its output
 provider-services run
