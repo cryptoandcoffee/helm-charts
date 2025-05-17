@@ -8,8 +8,6 @@ metadata:
     {{- include "provider.labels" . | nindent 4 }}
 spec:
   replicas: 1
-  #strategy:
-  #  type: OnDelete
   serviceName: {{ include "provider.fullname" . }}
   selector:
     matchLabels:
@@ -19,6 +17,7 @@ spec:
     metadata:
       annotations:
         checksum/cm-scripts: {{ include (print $.Template.BasePath "/configmap-scripts.yaml") . | sha256sum }}
+        checksum/cert-secret: {{ include (print $.Template.BasePath "/certificate-secret.yaml") . | sha256sum }}
       labels:
         app: {{ include "provider.fullname" . }}
         {{- include "provider.selectorLabels" . | nindent 8 }}
@@ -301,9 +300,9 @@ spec:
           secret:
             secretName: {{ include "provider.fullname" . }}-keys
         - name: provider-config-volume
-          hostPath:
-            path: /root/.akash/k8s-config
-            type: DirectoryOrCreate
+          secret:
+            secretName: {{ include "provider.fullname" . }}-cert
+            defaultMode: 0644
         - name: home
           emptyDir: {}
       {{- with .Values.nodeSelector }}
