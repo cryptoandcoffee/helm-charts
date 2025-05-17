@@ -10,66 +10,85 @@ if [[ -z "$PROVIDER_ADDRESS" ]]; then
   exit 1
 fi
 
+# Setup paths for certificates
 CERT_SYMLINK="${AKASH_HOME}/${PROVIDER_ADDRESS}.pem"
-CERT_REAL_PATH="/config/provider.pem"
-rm -vf "$CERT_SYMLINK"
-# Provider cert is coming from the mounted secret
-ln -sv "$CERT_REAL_PATH" "$CERT_SYMLINK"
-# 0 = yes; otherwise do not (re-)generate new provider certificate
-GEN_NEW_CERT=1
+CERT_SECRET_PATH="/config/provider.pem"
+CERT_WRITABLE_PATH="/tmp/provider.pem"
 
-# Check whether the certificate is present and valid on the blockchain
-if [[ -f "${CERT_REAL_PATH}" ]]; then
-  LOCAL_CERT_SN="$(cat "${CERT_REAL_PATH}" | openssl x509 -serial -noout | cut -d'=' -f2)"
+# Check if the certificate exists in the secret
+if [[ -f "${CERT_SECRET_PATH}" ]]; then
+  # Copy certificate from read-only secret to writable location
+  cp -f "${CERT_SECRET_PATH}" "${CERT_WRITABLE_PATH}"
+  
+  # Create symlink to the writable certificate
+  rm -vf "$CERT_SYMLINK"
+  ln -sv "${CERT_WRITABLE_PATH}" "$CERT_SYMLINK"
+  
+  # Check certificate validity on blockchain
+  LOCAL_CERT_SN="$(cat "${CERT_WRITABLE_PATH}" | openssl x509 -serial -noout | cut -d'=' -f2)"
   if [[ -n "$LOCAL_CERT_SN" ]]; then
     LOCAL_CERT_SN_DECIMAL=$(echo "obase=10; ibase=16; $LOCAL_CERT_SN" | bc)
     REMOTE_CERT_STATUS="$(AKASH_OUTPUT=json provider-services query cert list --owner $PROVIDER_ADDRESS --state valid --serial $LOCAL_CERT_SN_DECIMAL --reverse | jq -r '.certificates[0].certificate.state')"
     echo "Provider certificate serial number: ${LOCAL_CERT_SN}, status on chain: ${REMOTE_CERT_STATUS:-unknown}"
     
-    # If certificate is valid on chain, check expiration
-    if [[ "valid" == "$REMOTE_CERT_STATUS" ]]; then
-      # Check if certificate expires soon (within 7 days)
-      openssl x509 -checkend 604800 -noout -in "${CERT_REAL_PATH}" 2>/dev/null 1>&2
-      rc=$?
-      if [[ $rc -eq 0 ]]; then
-        echo "Certificate is valid and not expiring soon. No need to regenerate."
-        exit 0
-      else
-        echo "Certificate expires in less than 7 days, will generate a new one."
-        GEN_NEW_CERT=0
-      fi
+    # Check certificate expiration (7 days)
+    openssl x509 -checkend 604800 -noout -in "${CERT_WRITABLE_PATH}" 2>/dev/null 1>&2
+    EXPIRY_CHECK=$?
+    
+    if [[ "valid" == "$REMOTE_CERT_STATUS" && $EXPIRY_CHECK -eq 0 ]]; then
+      echo "Certificate is valid on chain and not expiring soon. No need to regenerate."
+      exit 0
     else
-      echo "Certificate exists but is not valid on chain. Will generate a new one."
-      GEN_NEW_CERT=0
+      if [[ "valid" != "$REMOTE_CERT_STATUS" ]]; then
+        echo "Certificate exists but is not valid on chain. Will generate a new one."
+      else
+        echo "Certificate expires in less than 7 days. Will generate a new one."
+      fi
     fi
   else
-    echo "LOCAL_CERT_SN variable is empty. Certificate file exists but may be empty or malformed."
-    GEN_NEW_CERT=0
+    echo "Certificate exists but appears to be malformed. Will generate a new one."
   fi
 else
-  echo "${CERT_REAL_PATH} file is missing. Will generate a new certificate."
-  GEN_NEW_CERT=0
+  echo "Certificate not found in secret. Will generate a new one."
 fi
 
-if [[ "$GEN_NEW_CERT" -eq "0" ]]; then
-  echo "Generating new provider certificate"
-  provider-services tx cert generate server provider.{{ .Values.domain }}
+# Certificate needs to be generated
+echo "Generating new provider certificate in writable path ${CERT_WRITABLE_PATH}"
 
-  echo "Publishing new provider certificate"
-  provider-services tx cert publish server
-  
-  # Save the new certificate to the secret
-  # First, retrieve the generated certificate
-  NEW_CERT=$(cat "${CERT_REAL_PATH}")
-  
-  # Create a temporary file with the new certificate
-  TEMP_CERT_FILE="/tmp/provider.pem"
-  echo "$NEW_CERT" > $TEMP_CERT_FILE
-  
-  # Update the Kubernetes secret
-  kubectl -n {{ .Release.Namespace }} create secret generic {{ include "provider.fullname" . }}-cert \
-    --from-file=provider.pem=$TEMP_CERT_FILE \
-    --dry-run=client -o yaml | kubectl apply -f -
-    
-  rm -f $TEMP_CERT_FILE
+# Ensure CERT_SYMLINK points to writable location
+rm -vf "$CERT_SYMLINK"
+touch "${CERT_WRITABLE_PATH}"
+ln -sv "${CERT_WRITABLE_PATH}" "$CERT_SYMLINK"
+
+# Generate new certificate
+provider-services tx cert generate server provider.{{ .Values.domain }}
+
+# Verify the new certificate was generated successfully
+if [[ ! -f "${CERT_WRITABLE_PATH}" || ! -s "${CERT_WRITABLE_PATH}" ]]; then
+  echo "ERROR: Certificate generation failed or certificate file is empty"
+  exit 1
 fi
+
+# Publish the new certificate
+echo "Publishing new provider certificate"
+provider-services tx cert publish server
+
+# Verify certificate was published successfully
+CERT_SN="$(cat "${CERT_WRITABLE_PATH}" | openssl x509 -serial -noout | cut -d'=' -f2)"
+if [[ -n "$CERT_SN" ]]; then
+  CERT_SN_DECIMAL=$(echo "obase=10; ibase=16; $CERT_SN" | bc)
+  PUBLISHED_STATUS="$(AKASH_OUTPUT=json provider-services query cert list --owner $PROVIDER_ADDRESS --state valid --serial $CERT_SN_DECIMAL --reverse | jq -r '.certificates[0].certificate.state')"
+  
+  if [[ "valid" == "$PUBLISHED_STATUS" ]]; then
+    echo "Certificate successfully published and verified on chain."
+  else
+    echo "WARNING: Certificate may not have been published correctly. Status: ${PUBLISHED_STATUS:-unknown}"
+  fi
+else
+  echo "WARNING: Unable to verify certificate publication. Certificate may be malformed."
+fi
+
+# The certificate is now in the writable path and symlinked correctly
+# Note: The certificate won't be automatically persisted to the secret
+# External process should capture this certificate for persistence
+echo "Certificate regeneration complete. Location: ${CERT_WRITABLE_PATH}"
